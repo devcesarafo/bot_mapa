@@ -1,0 +1,101 @@
+{
+ "tela": [
+  1920,
+  1080
+ ],
+ "regioes": {
+  "coordenada": [
+   1733,
+   51,
+   81,
+   18
+  ],
+  "vida_treinador": [
+   594,
+   896,
+   199,
+   23
+  ],
+  "vida_ditto_pokebar": [
+   48,
+   988,
+   153,
+   28
+  ],
+  "battle_list": [
+   7,
+   60,
+   188,
+   788
+  ],
+  "area_jogo": [
+   198,
+   39,
+   1523,
+   852
+  ]
+ },
+ "atalhos": {
+  "usuario": {
+   "revive": [
+    "key:e"
+   ],
+   "atacar": [
+    "key:r"
+   ],
+   "parar_ditto": [
+    "key:p",
+    "mouse:x1"
+   ],
+   "mover_ditto": [
+    "key:o",
+    "mouse:x2"
+   ],
+   "pokebola": [
+    "key:space"
+   ],
+   "defesa": [
+    "key:f"
+   ],
+   "cura": [
+    "key:c"
+   ],
+   "velocidade": [
+    "key:g"
+   ],
+   "stun": [
+    "alt+key:tab",
+    "key:f2"
+   ]
+  },
+  "bot": {
+   "revive": [
+    "key:e"
+   ],
+   "atacar": [
+    "key:r"
+   ],
+   "parar_ditto": [
+    "key:p"
+   ],
+   "mover_ditto": [
+    "key:o"
+   ],
+   "pokebola": [
+    "key:space"
+   ],
+   "defesa": [
+    "key:f"
+   ],
+   "cura": [
+    "key:c"
+   ],
+   "velocidade": [
+    "key:g"
+   ],
+   "stun": [
+    "key:f2"
+   ]
+  }
+ }
+}
