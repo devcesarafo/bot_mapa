@@ -31,6 +31,7 @@ Log: tela + monitor_logs\\bot_AAAA-MM-DD_HH-MM-SS.txt
 Dependências: pip install opencv-python numpy pillow mss pynput
 """
 import os
+import math
 import sys
 import json
 import threading
@@ -60,13 +61,19 @@ R_INTERVALO_S = 0.25        # entre apertos da rajada
 R_PAUSA_S = 1.0             # pausa entre rajadas (confere se o macro disparou)
 R_MIN_MONSTROS = 3          # só aperta R com pelo menos tantos monstros vivos (1 ou 2 = começo do próximo lure)
 R_EMERG_DITTO = True         # o bot aperta R sozinho quando a vida do Ditto está acabando (ver regra em _passo_R)
-R_EMERG_HP = 0.35
+R_EMERG_HP = 0.35            # Ditto abaixo disso (ou morrendo pela tendência): R de emergência, com as MESMAS travas do R normal
+R_EMERG_TTD_S = 2.0          # tendência: a vida zera em <= isso (estando <= 80%), 2 leituras seguidas
+R_EMERG_MUITO_HP = 0.20      # 'MORRENDO' (ou zera em <= 1,2 s): rede de segurança, bate mesmo sem as travas (Ditto andando, poucos no alcance)
 R_EMERG_PARADO_S = 2.0
 R_MAX_LURE = 12             # máximo de R por lure
 R_APOS_C_S = 1.0            # C logo antes do R atrasa o macro: segura o R depois de um C
+AJUSTE_CRUZ = True          # ajuste do Ditto = passo de 1 tile em cruz quando boxeado (False = mergulho/retirada de antes)
+CRUZ_FORA_S = 0.5           # monstro fora da área há pelo menos isso (0,3 s se o Ditto já perde vida) para pedir o passo
+CRUZ_ESPERA_R_S = 1.0       # depois do passo, com monstro já dentro da área: espera isso antes do R
 HUMANIZAR = True            # varia o intervalo do R em +-30% (se o desempenho cair, ponha False)
 REVIVE_STUN_MIN_S = 3.0     # revive com monstro vivo: o stun precisa ter pelo menos isso sobrando (o Ditto some ~1 s)
 REVIVE_SEM_MONSTROS_S = 0.0 # revive só para resetar: lista vazia (todos mortos) = pode bater na hora, mas em 2 leituras seguidas
+REVIVE_RESET_PARADO_S = 1.5   # revive de RESET (sem monstros na lista) só com o personagem PARADO há isso: lista vazia andando não é lure acabado
 REVIVE_APOS_STUN_S = 1.0    # revive com monstros VIVOS (stunados): espera todos estarem stunados há pelo menos isso (monstro que já ativou a skill ainda causa dano)
 REVIVE_CONFIRMA_S = 1.5     # prazo para o revive aparecer (Ditto some ou skills resetam)
 REVIVE_MAX_TENT = 2
@@ -94,6 +101,8 @@ class Executor:
         self.r_aviso_t = -99.0
         self.hp_hist = []              # (t, hp do Ditto) dos últimos ~2,5 s
         self.emerg_flag = False
+        self.emerg_muito = False
+        self.ttd_seguidas = 0
         self.parado_s = None           # segundos com o personagem parado (o main preenche pela coordenada)
         self.emerg_txt = ""
         self.t_fora = -99.0            # última vez que vimos monstro FORA do alcance (com o Ditto localizado)
@@ -104,6 +113,7 @@ class Executor:
         self.rev_aviso_t = self.perigo_t = -99.0
         self.rev_vazio = 0
         self.stun_garantido_ate = -99.0
+        self.pode_resetar = None                              # callable(t) -> bool: o bot (--andar) só libera o reset na parada, depois de ver o bando
         self.stun_todos_desde, self.stun_todos_n = None, 0   # desde quando TODOS os monstros vivos estão confirmados stunados
 
     def _avisar_perigo(self, t, r):
@@ -114,11 +124,13 @@ class Executor:
                          f"(stun garantido por mais ~{self.stun_garantido_ate - t:.1f} s). Leitura do stun durante o revive: {r.get('stun_dbg', '')}")
                 return
             self.log(f"[PERIGO] {r['cartoes']['REVIVE'][1]}  >>> O BOT NÃO FOGE SOZINHO: FUJA VOCÊ <<< ({r.get('stun_dbg', '')})")
-            try:
-                import winsound
-                winsound.Beep(1400, 350)
-            except Exception:
-                pass
+            def _apita():                                   # em thread: o Beep bloqueia o laço de leitura
+                try:
+                    import winsound
+                    winsound.Beep(1400, 350)
+                except Exception:
+                    pass
+            threading.Thread(target=_apita, daemon=True).start()
 
     def _passo_revive(self, t, r, cd):
         """Revive (tecla e). Três casos, todos com o Ditto presente e leitura válida:
@@ -152,6 +164,14 @@ class Executor:
         elif r.get("area_esgotada") and r["n_monstros"] > 0 and t - self.rev_aviso_t > 4.0:
             self.rev_aviso_t = t
             self.log(f"[REVIVE] aguardando (skills de área esgotadas): {r['cartoes']['REVIVE'][1]}")
+        if tipo == "resetar":
+            parado_ok = (self.parado_s or 0.0) >= REVIVE_RESET_PARADO_S
+            if not parado_ok or (self.pode_resetar is not None and not self.pode_resetar(t)):
+                if t - self.rev_aviso_t > 4.0:
+                    self.rev_aviso_t = t
+                    self.log("[REVIVE] reset ADIADO: lista vazia, mas " +
+                             ("o personagem está andando" if not parado_ok else "ainda não vi o bando nesta parada (pode estar atrás, fora da tela)") + ".")
+                return None
         if tipo is None:
             return None
         if tipo != "resetar" and rv["count"] >= REVIVE_MAX_LURE:
@@ -187,26 +207,45 @@ class Executor:
         # personagem parado há >= 3 s, Ditto <= 35%, a maioria (>= 60%) no alcance e o Ditto parado e visto. Sobram os de fora.
         emerg_ok = False
         bloq_forte = False
-        if (R_EMERG_DITTO and r.get("acao_R") and tipo in ("emergencia", "espera_fora") and not r.get("area_esgotada")
-                and r.get("n_monstros", 0) >= R_MIN_MONSTROS and r.get("ditto_pos") is not None):
+        muito_critico = False
+        if R_EMERG_DITTO and r.get("ditto_presente") and not r.get("revive_em_curso") and r.get("n_monstros", 0) >= 1:
             hp_d = r.get("ditto_hp")
-            parado_s = self.parado_s if self.parado_s is not None else (R_EMERG_PARADO_S if r.get("n_parado") else 0.0)
-            n_dentro = r.get("n_loc", 0) - r.get("n_fora", 0)
-            prev = 1.0                                          # vida prevista em 2 s pela TENDÊNCIA (16 Gogoats tiram 70% em ~2 s)
+            rate = None                                         # queda de vida por segundo (a partir do pico dos últimos 2 s)
             if hp_d is not None and len(self.hp_hist) >= 2:
                 t_max, h_max = max(((tt, h) for tt, h in self.hp_hist if t - tt <= 2.0), key=lambda x: x[1], default=(t, hp_d))
                 if t - t_max >= 0.3 and h_max > hp_d:
-                    prev = hp_d - (h_max - hp_d) / (t - t_max) * 2.0
-                else:
-                    prev = hp_d
-            critico = hp_d is not None and (hp_d <= R_EMERG_HP or (hp_d <= 0.65 and prev <= 0.10))
-            muito_critico = hp_d is not None and (hp_d <= 0.2 or prev <= 0.05)
-            minimo = max(R_MIN_MONSTROS, (0.4 if muito_critico else 0.6) * r["n_monstros"])
-            bloq_forte = self.r_bloq == "Ditto em movimento"    # esperar 'assentar'/'ver o Ditto' custa vida: só o movimento bloqueia
-            if critico and parado_s >= R_EMERG_PARADO_S and not bloq_forte and n_dentro >= minimo:
+                    rate = (h_max - hp_d) / (t - t_max)
+            ttd = (hp_d / rate) if (rate and hp_d is not None) else 99.0     # segundos até a vida zerar, se a queda continuar
+            prev = max(0.0, hp_d - rate * 2.0) if (rate and hp_d is not None) else (hp_d if hp_d is not None else 1.0)
+            # gatilho por TENDÊNCIA exige 2 leituras seguidas (um quadro com a barra mal lida não dispara o R); o por vida baixa, 1
+            self.ttd_seguidas = self.ttd_seguidas + 1 if (hp_d is not None and hp_d <= 0.80 and ttd <= R_EMERG_TTD_S) else 0
+            tend = self.ttd_seguidas >= 2
+            critico = hp_d is not None and (hp_d <= R_EMERG_HP or tend)
+            muito_critico = hp_d is not None and (hp_d <= R_EMERG_MUITO_HP or (tend and ttd <= 1.2))
+            n_dentro = (r.get("n_loc", 0) - r.get("n_fora", 0)) if r.get("ditto_pos") is not None else None
+            n_mon = r["n_monstros"]
+            bloq_forte = self.r_bloq == "Ditto em movimento"
+            # (1) emergência NORMAL: as mesmas travas de antes (o Cerebro pede o R, personagem parado, >= 60% no alcance, Ditto parado)
+            min_normal = min(n_mon, max(R_MIN_MONSTROS, math.ceil(0.6 * n_mon)))
+            ok_normal = (critico and r.get("acao_R") and tipo in ("emergencia", "espera_fora") and not r.get("area_esgotada")
+                         and (self.parado_s or 0.0) >= R_EMERG_PARADO_S and n_dentro is not None and n_dentro >= min_normal and not bloq_forte)
+            # (2) rede de segurança: o Ditto está MORRENDO (<= 20% ou zera em <= 1,2 s): bate mesmo sem as travas, com >= 1 monstro no alcance
+            ok_morrendo = (muito_critico and not r.get("area_esgotada")
+                           and (n_dentro is None or n_dentro >= 1))
+            if critico and r.get("area_esgotada"):
+                if t - self.r_aviso_t > 3.0:
+                    self.r_aviso_t = t
+                    self.log(f"[PERIGO] Ditto {hp_d * 100:.0f}% (morre em ~{min(ttd, 99):.0f} s) e as skills de área estão EM RECARGA: R não adianta. Decida você (C/fuga).")
+            elif ok_normal or ok_morrendo:
                 emerg_ok = True
-                self.emerg_txt = (f"⚠ EMERGÊNCIA: Ditto {hp_d * 100:.0f}% (previsto {max(prev, 0) * 100:.0f}% em 2 s), parado há {parado_s:.0f} s, "
-                                  f"{n_dentro} de {r['n_monstros']} no alcance; sobram {r['n_monstros'] - n_dentro}")
+                muito_critico = ok_morrendo and not ok_normal
+                self.emerg_txt = (f"⚠ EMERGÊNCIA: Ditto {hp_d * 100:.0f}% (queda {0 if rate is None else rate * 100:.0f}%/s, previsto {prev * 100:.0f}% em 2 s, "
+                                  f"morre em ~{min(ttd, 99):.0f} s)" + (", MORRENDO: sem as travas normais" if muito_critico else "")
+                                  + (f", {n_dentro} de {n_mon} no alcance" if n_dentro is not None else ", Ditto não localizado")
+                                  + (", Ditto andando" if bloq_forte else ""))
+            else:
+                muito_critico = False
+        self.emerg_muito = muito_critico
         self.emerg_flag = emerg_ok
         if (r.get("acao_R") and tipo in ("emergencia", "espera_fora") and not r.get("area_esgotada") and not emerg_ok
                 and t - self.r_aviso_t > 4.0):
@@ -222,13 +261,13 @@ class Executor:
         quer = (bool(r.get("acao_R")) and not r.get("area_esgotada") and tipo in ("curso", "normal") and not poucos) or emerg_ok
         if r.get("ditto_pos") is not None and r.get("n_fora", 0) > 0:
             self.t_fora = t
-        if quer and r.get("ditto_pos") is None and t - self.t_fora < 6.0:
+        if quer and not emerg_ok and r.get("ditto_pos") is None and t - self.t_fora < 6.0:
             if t - self.r_aviso_t > 4.0:
                 self.r_aviso_t = t
                 self.log(f"[R] aguardando: Ditto não localizado e havia monstro fora do alcance há {t - self.t_fora:.1f} s "
                          "(o 'monstros juntos' sem o Ditto não prova que todos estão no alcance).")
             quer = False
-        if quer and self.r_bloq and not (emerg_ok and not bloq_forte):          # emergência só respeita o Ditto EM MOVIMENTO
+        if quer and self.r_bloq and not (emerg_ok and (not bloq_forte or muito_critico)):   # emergência só respeita o Ditto andando (e se for MUITO crítico, nem isso)
             if t - self.r_aviso_t > 4.0:
                 self.r_aviso_t = t
                 self.log(f"[R] aguardando: {self.r_bloq} (o R só sai com o Ditto parado e visto na posição final).")
@@ -245,10 +284,10 @@ class Executor:
         if quer and r.get("area_esgotada") is False and self.r_count >= R_MAX_LURE and not self.r_limite_logado:
             self.r_limite_logado = True
             self.log(f"[limite] {R_MAX_LURE} R neste lure: bot não aperta mais R. Aperte à mão se precisar.")
-        if t - self.t_C < R_APOS_C_S or shift:
+        if (t - self.t_C < R_APOS_C_S and not emerg_ok) or shift:        # emergência não espera o C
             return None
         if self.r_restam == 0:
-            if not (quer and self.r_visto >= (1 if emerg_ok else LEITURAS_SEGUIDAS) and t >= self.r_pausa_ate and self.r_count < R_MAX_LURE):
+            if not (quer and self.r_visto >= (1 if emerg_ok else LEITURAS_SEGUIDAS) and t >= self.r_pausa_ate and self.r_count < R_MAX_LURE + (6 if emerg_ok else 0)):
                 return None
             self.r_restam, self.r_snap = R_POR_RAJADA, {k: bool(cd.get(k)) for k in AREA}
             self.log(f"[R] rajada de {R_POR_RAJADA}: {r['cartoes']['ATAQUE'][1]} "
@@ -365,7 +404,7 @@ def ler_visao(arr, b, pool):
     return cav, fa.result(), dpos
 
 
-def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=False):
+def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=False, fuga_agir=False):
     import mss
     from pynput import keyboard as pk
     base = os.path.dirname(os.path.abspath(__file__))
@@ -425,6 +464,9 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
         return k in (pk.Key.shift, pk.Key.shift_l, pk.Key.shift_r)
 
     def on_press(k):
+        ch = getattr(k, "char", None)
+        if ch and ch.lower() == TECLA_REVIVE:
+            est["t_e"] = time.perf_counter() - t0               # revive apertado (por você OU pelo bot): explica o Ditto sumir da lista
         if e_shift(k):
             est["shift"] = True
         elif est["shift"] and getattr(k, "char", None) and k.char.lower() == "f":
@@ -525,7 +567,7 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
                     time.sleep(0.025)
         threading.Thread(target=thread_ditto, daemon=True).start()
     # ---- FASE 5 / etapa 1: o Player (player_lures.py) anda o laço e fica na parada até o PORTÃO abrir. Só em --seco.
-    player, portao = None, None
+    player, portao, rota_p = None, None, None
     if andar:
         from portao import Portao
         from player_lures import Player, MundoReal, TeclasSeco, TeclasPynput, Relogio, montar_rota
@@ -539,6 +581,8 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
                         tol_parada=2 if seco else 0, log=lambda m: log("[andar] " + m),
                         portao=lambda _agora: portao.estado(time.perf_counter() - t0))
         est["player"] = player                              # Shift+F para o Player na hora (ver on_press)
+        player.on_parada = lambda exige: portao.nova_parada(time.perf_counter() - t0, exige)
+        player.on_saida = portao.fim_parada
 
         def thread_player():
             if not seco:
@@ -560,9 +604,29 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
                     pass
         threading.Thread(target=thread_player, daemon=True).start()
         log(f"[andar] {'SECO: só mostra o que faria. Você anda à mão.' if seco else 'REAL: o Player ANDA o laço (WASD). Fique de olho.'} ({len(rota_p)} lures)")
+    if portao is not None:                                    # revive de reset só na parada e depois de ver o bando
+        ex.pode_resetar = lambda tt: portao.parada_ativa and portao.visto
+    # ---- FASE 5 / etapa 3: FUGA. Sem --fuga (ou com --seco) só LOG do que faria; com --fuga o personagem foge de verdade.
+    fuga, vigia_d, trilha = None, None, None          # (vigia_d = vigia do Ditto; 'vigia' já é o ouvinte de atalhos)
+    fuga_age = bool(fuga_agir and not seco and player is not None)
+    try:
+        from fuga import Fuga
+        from trilha import Trilha
+        from vigia import VigiaDitto
+        from editor_mapa import ObstacleMap as _OM
+        trilha = Trilha()
+        fuga = Fuga(_OM.load(os.path.join(base, "mapa_obstaculos.json")), log, rota_p, agir=fuga_age, trilha=trilha)
+        vigia_d = VigiaDitto(reg_bl, t0, mss, log)             # lê só a Battle list a ~15x/s: a morte do Ditto não pode esperar o laço lento
+        vigia_d.iniciar()
+        if fuga_agir and not fuga_age:
+            log("[fuga] --fuga pedido, mas só funciona com --andar e SEM --seco: ficou só LOG.")
+        log("[fuga] " + ("LIGADA: Ditto morto = REVIVE NA HORA (e foge se houver monstro); sobra sem recurso = foge, sai da tela e bate o revive. Shift+F cancela."
+                         if fuga_age else "só LOG: detecta os gatilhos e mostra o que faria, NÃO age (use --fuga para ligar)."))
+    except Exception as e_f:
+        log(f"[fuga] desligada ({e_f}).")
     reg = {"bl": reg_bl, "valida": False, "vazia_desde": None, "ult_calib": -9.0}
     log(f"BOT FASE 1 {'(SECO: não envia nada) ' if seco else ''}iniciado. Parada de emergência: Shift+F.")
-    log("[versao] fase 5.2: ditto_fim gravado + revive 1 s após stun + --andar real/seco")
+    log("[versao] fase 5.9: fuga v4 (morte do Ditto na hora, trilha de 1 min, revive na hora certa) + sem revive/portão com o bando fora da tela + fuga em cruz sem beco + isca + revive correndo (--fuga liga) + R de emergência (travas de antes) + passo em cruz + ditto_fim + --andar")
     if sem_hum:                                           # desliga TODA variação: R no ritmo fixo, Ditto no tile exato gravado
         global HUMANIZAR
         HUMANIZAR = False
@@ -573,6 +637,8 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
         log("[hum] humanização LIGADA: R ±30% e Ditto ±1 tile em ~40% dos lures (Player andando: sem variação).")
     n, ult_aviso, ult_erro = 0, 0.0, -9.0
     fora_desde, ult_sem_plano, pred_feita, ultimo_tipo = {}, -9.0, False, None
+    cz_fora = {}
+    ult_co, t_mov = None, 0.0
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(1)
@@ -626,6 +692,46 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
                 try:
                     if portao is not None:
                         portao.atualizar(t, r, fps >= FPS_MIN and sks is not None)
+                    if fuga is not None and co and r["nivel"] != CINZA and fps >= FPS_MIN:
+                        li_f = ((player.estado.get("lure") or 1) - 1) if player is not None else None
+                        pos_viva = player.mundo.pos() if player is not None else None          # onde o personagem está AGORA
+                        coord_f = (pos_viva[0], pos_viva[1]) if pos_viva else (co[0], co[1])
+                        trilha.registrar(t, coord_f)                                               # por onde andei e quando (limite de 1 min)
+                        t_e = max(est.get("t_e", -99.0), ex.rev["t_envio"] if ex.rev["t_envio"] is not None else -99.0)
+                        af = fuga.atualizar(t, r, coord_f, cav, ex.rev["t_envio"] is not None or (t - ex.rev["ult"] < 3.0), li_f,
+                                            bool(player is not None and player.na_parada), bool(player is not None and player.fuga_fim),
+                                            ex.rev["ult"], (co[0], co[1]), vigia_d.estado(), t_e)
+                        if af and fuga_age:
+                            if af.get("fugir"):
+                                if dctl is not None:
+                                    dctl.pausado = True                    # o Ditto não recebe O/P enquanto o personagem foge
+                                player.pedir_fuga(af["fugir"]["caminho"])
+                            if af.get("isca") and dctl is not None:
+                                dctl.isca(af["isca"][0], af["isca"][1])   # Ditto VIVO: vai para o lado oposto ao da fuga
+                            if af.get("parar"):
+                                player.fuga_cancel.set()
+                            if af.get("revive"):
+                                enviar(TECLA_REVIVE)
+                                ex.rev["ult"] = t
+                            if af.get("fim"):
+                                if dctl is not None:
+                                    dctl.pausado = False
+                                player.fuga_cancel.clear()
+                            if af.get("alarme"):
+                                log(f"[fuga] !!! {af['alarme'].upper()} !!!")
+
+                                def _apita():                                  # em thread: o Beep bloqueia ~1 s e travava o laço
+                                    try:
+                                        import winsound
+                                        for _ in range(3):
+                                            winsound.Beep(1800, 350)
+                                    except Exception:
+                                        pass
+                                threading.Thread(target=_apita, daemon=True).start()
+                    if co is not None:                                      # tempo parado pela coordenada (vale sem --ditto)
+                        if co != ult_co:
+                            ult_co, t_mov = co, t
+                        ex.parado_s = t - t_mov
                     if dctl is not None:
                         ex.r_bloq = dctl.bloqueia_R(t)
                         ex.parado_s = dctl.parado_ha(t)           # R só com o Ditto parado e visto na posição final
@@ -642,12 +748,51 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
                             dctl.visto_ditto(t)
                         if dctl.consumir_esquecer():
                             c.esquecer_ditto()                   # posição guardada do Ditto (1,5 s) deixou de valer
+                        # PASSO EM CRUZ (AJUSTE_CRUZ): o Ditto só anda 1 tile (N/L/S/O) e só quando está BOXEADO (8 tiles em volta obstruídos)
+                        # com monstro parado fora da área. Depois do passo: se já há monstro dentro da área, espera 1 s antes do R.
+                        if AJUSTE_CRUZ and alvo is not None and dctl.ult_coord is not None:
+                            d_ref_c = dpos if dpos is not None else (tuple(r["ditto_pos"]) if r.get("ditto_pos") else None)
+                            tq = None
+                            if d_ref_c is not None:
+                                mon_off_c = [((cv[0] - 959) / 72.3, (cv[1] - 452) / 72.3) for cv in cav]
+                                d_off_c = ((d_ref_c[0] - 959) / 72.3, (d_ref_c[1] - 452) / 72.3)
+                                M_c, D_c = alvo.tiles(dctl.ult_coord, mon_off_c, d_off_c)
+                                tq = D_c is not None
+                            if dctl.verif_cruz and dctl.t_visto > dctl.t_ult_P + 0.3:          # (A) conferência depois do passo
+                                dctl.verif_cruz = False
+                                if tq:
+                                    dentro = sum(1 for m in M_c if alvo.na_area(m, D_c))
+                                    if dentro >= 1:
+                                        dctl.segurar_R(t, CRUZ_ESPERA_R_S)
+                                        log(f"[ditto] depois do passo: {dentro} de {len(M_c)} monstro(s) dentro da área: espero {CRUZ_ESPERA_R_S:.0f} s antes do R.")
+                                    else:
+                                        log(f"[ditto] depois do passo: nenhum monstro dentro da área ainda (0 de {len(M_c)}).")
+                            elif dctl.verif_cruz and t - dctl.t_ult_P > 2.5:
+                                dctl.verif_cruz = False
+                                log("[ditto] depois do passo: não vi o Ditto para conferir a área.")
+                            if (tq and dctl.parado_ha(t) >= 0.8 and r["n_monstros"] >= R_MIN_MONSTROS and not r["area_esgotada"]
+                                    and r.get("R_tipo") != "curso" and not ex.emerg_flag):          # (B) boxeado + monstro fora da área
+                                fora_c = [m for m in M_c if not alvo.na_area(m, D_c)]
+                                cz_fora = {m: cz_fora.get(m, t) for m in fora_c}
+                                perigo_c = (r["ditto_hp"] or 1.0) < 0.7 or r["queda_total"] >= 0.08
+                                lim_c = 0.3 if perigo_c else CRUZ_FORA_S
+                                parados_c = [m for m, desde in cz_fora.items() if t - desde >= lim_c]
+                                if parados_c and dctl.pode_reposicionar(t, cruz=True):
+                                    res = alvo.passo_cruz(dctl.ult_coord, mon_off_c, d_off_c, r["n_monstros"])
+                                    if res[0] is not None:
+                                        dctl.pedir_reposicionar(t, res[0], res[1], 1, res[2] + f" [Ditto {((r['ditto_hp'] or 0) * 100):.0f}%]", cruz=True)
+                                        cz_fora = {}
+                                    elif t - ult_sem_plano > 5.0:
+                                        ult_sem_plano = t
+                                        log(f"[ditto] sem passo ({len(parados_c)} fora da área): {res[2]}.")
+                            else:
+                                cz_fora = {}
                         # AJUSTE do Ditto: 1º MERGULHO no grupo (tile que põe mais monstros na área), 2º RETIRADA para o aberto; alterna se o
                         # anterior não resolveu. ANTECIPADO: 0,8 s depois de parar, se a área tem obstáculos demais para a lista.
                         # REATIVO: monstro parado fora da área há 1,0 s (0,6 s se o Ditto já perde vida).
                         if dctl.parado_ha(t) < 0.3:
                             pred_feita = False
-                        if (alvo is not None and dctl.parado_ha(t) >= 0.8 and r["n_monstros"] >= R_MIN_MONSTROS
+                        if (not AJUSTE_CRUZ and alvo is not None and dctl.parado_ha(t) >= 0.8 and r["n_monstros"] >= R_MIN_MONSTROS
                                 and not r["area_esgotada"] and r.get("R_tipo") != "curso" and not ex.emerg_flag):
                             d_ref = dpos if dpos is not None else (tuple(r["ditto_pos"]) if r.get("ditto_pos") else None)
                             if d_ref is not None and dctl.ult_coord is not None:
@@ -698,7 +843,10 @@ def main(seco=False, lures=None, revive=True, ditto=False, andar=False, sem_hum=
             except Exception:
                 pass
         est["fim"] = True
+        if vigia_d is not None:
+            vigia_d.encerrar()
         if player is not None:
+            player.fuga_cancel.set()
             player.parar.set()
             try:
                 player.teclas.soltar_tudo()
@@ -752,4 +900,4 @@ if __name__ == "__main__":
         diagnostico(a[i + 1] if len(a) > i + 1 else None)
         sys.exit(0)
     main(seco="--seco" in a, lures=a[a.index("--lures") + 1] if "--lures" in a else None, revive="--sem-revive" not in a,
-         ditto="--ditto" in a, andar="--andar" in a, sem_hum="--sem-hum" in a)
+         ditto="--ditto" in a, andar="--andar" in a, sem_hum="--sem-hum" in a, fuga_agir="--fuga" in a)

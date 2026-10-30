@@ -37,6 +37,9 @@ REPOS_VEL_TILES_S = 4.0                # velocidade assumida do Ditto (com o buf
 REPOS_ENTRE_S = 2.5                    # mínimo entre dois ajustes (para ver o efeito)
 REPOS_O_INTERVALO_S = 0.25
 SETTLE_P_S = 0.5                       # depois de um P o Ditto precisa de um tempo parado antes do R
+CRUZ_ENTRE_S = 1.6                     # passo em cruz (1 tile): mínimo entre dois passos
+CRUZ_MAX_CICLO = 8                     # passos em cruz por lure
+CRUZ_DUR_S = 0.6                       # duração do passo de 1 tile (2 O + P)
 VER_MAX_S = 2.0                        # depois de um ajuste: espera ver o Ditto de novo (no máx.) antes de liberar o R
 PARADO_S = 0.35
 O_APOS_PARAR_S = 0.4
@@ -62,6 +65,8 @@ class DittoCtl:
         self.n_O = 0
         self.pedido, self.repos_count, self.t_repos, self.t_fim_repos = None, 0, 0.0, -99.0
         self.t_ult_P, self.t_visto, self.precisa_ver, self.esquecer = -99.0, -99.0, False, False
+        self.pausado = False                                # fuga: o personagem foge e o Ditto NÃO recebe O/P
+        self.verif_cruz, self.seg_R_ate = False, -1.0     # passo em cruz: conferir monstro na área depois / segurar o R 1 s
 
     # ---- chamado pela thread principal
     def renovar(self, t, ok, hp=None, n_mon=None):
@@ -76,6 +81,7 @@ class DittoCtl:
         if n_mon <= CICLO_MAX_MON:
             self.estado, self.t_rev, self.ponto_P = "espera_P", t, None
             self.repos_count, self.pedido = 0, None
+            self.verif_cruz, self.seg_R_ate = False, -1.0
             if self.alvo is not None and self.ult_coord is not None:
                 self.alvo.iniciar_lure(self.ult_coord)
             self.log(f"[ditto] Ditto voltou do revive ({n_mon} monstro(s)): P assim que o personagem andar.")
@@ -83,19 +89,40 @@ class DittoCtl:
             self.estado = "idle"
             self.log(f"[ditto] revive com {n_mon} monstros vivos (luta): não mexo no Ditto.")
 
-    def pode_reposicionar(self, t):
+    def pode_reposicionar(self, t, cruz=False):
         """Ajuste possível no 'seguro' ou JÁ no 'parando' (0,6 s depois de parar): o ajuste substitui o P final, ganhando tempo."""
         ok_estado = self.estado == "seguro" or (self.estado == "parando" and t - self.t_parou >= 0.6)
-        return (ok_estado and self.pedido is None and self.repos_count < REPOS_MAX_CICLO
-                and t - self.t_fim_repos > REPOS_ENTRE_S and self.ult_coord is not None)
+        max_c, entre = (CRUZ_MAX_CICLO, CRUZ_ENTRE_S) if cruz else (REPOS_MAX_CICLO, REPOS_ENTRE_S)
+        return (ok_estado and self.pedido is None and self.repos_count < max_c
+                and t - self.t_fim_repos > entre and self.ult_coord is not None)
 
-    def pedir_reposicionar(self, t, tx, ty, dist_tiles, info):
-        """Ajuste DELICADO: 2 apertos de O (3 se > 2 tiles), 0,3 s entre eles, e P assim que o Ditto deve ter chegado."""
+    def pedir_reposicionar(self, t, tx, ty, dist_tiles, info, cruz=False):
+        """Ajuste DELICADO: 2 apertos de O (3 se > 2 tiles), 0,3 s entre eles, e P assim que o Ditto deve ter chegado.
+        cruz=True: passo de 1 tile (2 O, P em 0,6 s) e, quando terminar, o bot confere se há monstro dentro da área."""
         n_o = 2 if dist_tiles <= 2 else (3 if dist_tiles <= 5 else 5)     # distâncias longas (retirada): mais apertos
-        dur = max(0.7, dist_tiles / REPOS_VEL_TILES_S + 0.4)
-        self.pedido = {"tx": tx, "ty": ty, "dur": dur, "n_o": n_o, "t": t}
+        dur = CRUZ_DUR_S if cruz else max(0.7, dist_tiles / REPOS_VEL_TILES_S + 0.4)
+        self.pedido = {"tx": tx, "ty": ty, "dur": dur, "n_o": n_o, "t": t, "cruz": cruz}
         self.esquecer = True
-        self.log(f"[ditto] AJUSTE ({self.repos_count + 1}/{REPOS_MAX_CICLO}): {info}")
+        self.log(f"[ditto] {'PASSO' if cruz else 'AJUSTE'} ({self.repos_count + 1}/{CRUZ_MAX_CICLO if cruz else REPOS_MAX_CICLO}): {info}")
+
+    def isca(self, tx, ty, n=3, intervalo=0.25):
+        """FUGA: manda o Ditto para o tile (tx, ty) relativo ao personagem (lado OPOSTO ao da fuga): os monstros correm para ele.
+        Roda numa thread própria (n apertos de O com o mouse no tile); funciona mesmo com o ctl pausado."""
+        import threading as _th
+        import time as _tm
+
+        def _go():
+            px = min(max(CENTRO_JOGO[0] + tx * TILE, AREA_MOUSE[0]), AREA_MOUSE[2])
+            py = min(max(CENTRO_JOGO[1] + ty * TILE, AREA_MOUSE[1]), AREA_MOUSE[3])
+            self.mouse((int(px), int(py)))
+            for _ in range(n):
+                self.tecla("o")
+                _tm.sleep(intervalo)
+            self.log(f"[ditto] ISCA: Ditto mandado para ({tx:+d},{ty:+d}) do personagem (lado oposto da fuga).")
+        _th.Thread(target=_go, daemon=True).start()
+
+    def segurar_R(self, t, s):
+        self.seg_R_ate = max(self.seg_R_ate, t + s)
 
     def parado_ha(self, t):
         """Há quantos segundos a coordenada do personagem não muda."""
@@ -121,6 +148,8 @@ class DittoCtl:
                 return "esperando ver o Ditto na posição nova"
             else:
                 self.precisa_ver = False
+        if t < self.seg_R_ate:                          # NÃO é "em movimento": o R de emergência passa por cima desta espera
+            return "aguardando 1 s depois do passo (monstro dentro da área)"
         return None
 
     def desligar(self):
@@ -181,7 +210,7 @@ class DittoCtl:
         self.hist.append((t, c[0], c[1]))
         while self.hist and t - self.hist[0][0] > 2.0:
             self.hist.popleft()
-        if self.estado == "idle" or t > self.ok_ate:
+        if self.pausado or self.estado == "idle" or t > self.ok_ate:
             return
         parado = t - self.ult_mudanca >= PARADO_S
         if self.estado == "espera_P":
@@ -200,6 +229,7 @@ class DittoCtl:
                 self.estado, self.pedido, self.t_fim_repos = "seguro", None, t
                 self.repos_count += 1
                 self.precisa_ver, self.esquecer = True, True
+                self.verif_cruz = bool(p.get("cruz"))
             elif t >= self.prox_O and self.n_O < p["n_o"]:
                 px, py = CENTRO_JOGO[0] + p["tx"] * TILE, CENTRO_JOGO[1] + p["ty"] * TILE
                 self.mouse((int(min(max(px, AREA_MOUSE[0]), AREA_MOUSE[2])), int(min(max(py, AREA_MOUSE[1]), AREA_MOUSE[3]))))

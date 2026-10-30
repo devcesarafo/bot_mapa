@@ -364,6 +364,9 @@ class Player:
                  seco=False, log=print, verbose=False, seed=None, portao=None, tol_parada=0):
         self.tol_parada = tol_parada   # tiles de folga no ÚLTIMO ponto do lure (0 = exato; seco/acompanhar usa 2)
         self._t_status = -99.0
+        self.fuga_pedido, self.fuga_fim, self._em_fuga, self.na_parada = None, False, False, False   # fase 5 / fuga
+        self.fuga_cancel = threading.Event()
+        self.on_parada, self.on_saida = None, None      # avisam o portão: chegou numa parada (exige o bando?) / saiu dela
         self.portao = portao      # fase 5: callable(agora) -> (liberado, motivo); None = espera fixa (parada_s) como antes
         self.obst, self.rota = obst, rota
         self.mundo, self.teclas, self.rel = mundo, teclas, rel
@@ -457,6 +460,9 @@ class Player:
         while True:
             if self.parar.is_set():
                 return "PARADO"
+            if self._em_fuga and self.fuga_cancel.is_set():
+                self._teclas(set())
+                return "CANCELADO"
             p = self.mundo.pos()
             if p is None:
                 self._teclas(set())
@@ -583,7 +589,7 @@ class Player:
                 return res
         return "OK"
 
-    def parada(self, li):
+    def parada(self, li, dur_lure=99.0):
         lu = self.rota[li]
         self._teclas(set())
         if self.portao is None:                      # modo antigo (GUI/simulação): só espera
@@ -593,13 +599,102 @@ class Player:
             return
         # fase 5: fica PARADO até o combate acabar. Nunca anda por tempo: só o portão libera.
         self.log(f"PARADA {li + 1} em {lu['wps'][-1]}: aguardando o fim do combate (portão)")
-        self._aguardar_portao(f"indo para o lure {(li + 1) % len(self.rota) + 1}")
+        self._aguardar_portao(f"indo para o lure {(li + 1) % len(self.rota) + 1}", li, exige=dur_lure >= 3.0)
 
-    def _aguardar_portao(self, destino):
-        """Solta as teclas e espera o portão abrir. True = abriu; False = pediram para parar."""
+    def pedir_fuga(self, caminho):
+        """Chamado pelo bot (outra thread): foge pelo caminho (lista de tiles) assim que o Player estiver esperando na parada."""
+        self.fuga_cancel.clear()
+        self.fuga_fim = False
+        self.fuga_pedido = list(caminho)
+
+    def _seguir_cardinal(self, cam, timeout_s=None):
+        """Segue um caminho de tiles SÓ EM CRUZ: uma tecla por vez (W/A/S/D), nunca diagonal. -> OK | TRAVADO | FORA_DO_CAMINHO | PARADO | CANCELADO | SEM_LEITURA"""
+        idx = {tuple(q): i for i, q in enumerate(cam)}
+        fim = self.rel.agora() + (timeout_s or (len(cam) * 1.2 + 4.0))
+        ult_p, ult_t = None, self.rel.agora()
+        sem_leitura = None
+        while True:
+            if self.parar.is_set():
+                return "PARADO"
+            if self._em_fuga and self.fuga_cancel.is_set():
+                return "CANCELADO"
+            if self._em_fuga and self.fuga_pedido is not None:      # a fuga mandou a CONTINUAÇÃO: troca o caminho sem parar de andar
+                cam, self.fuga_pedido = self.fuga_pedido, None
+                idx = {tuple(q): i for i, q in enumerate(cam)}
+                fim = self.rel.agora() + (len(cam) * 1.2 + 4.0)
+                self.fuga_fim = False
+            agora = self.rel.agora()
+            if agora > fim:
+                return "TRAVADO"
+            p = self.mundo.pos()
+            if p is None:
+                self._teclas(set())
+                sem_leitura = sem_leitura or agora
+                if agora - sem_leitura > 1.5:
+                    return "SEM_LEITURA"
+                self.rel.dormir(0.05)
+                continue
+            sem_leitura = None
+            xy = (p[0], p[1])
+            if xy == tuple(cam[-1]):
+                return "OK"
+            i = idx.get(xy)
+            if i is None:                                    # saiu do caminho por 1-2 tiles (leitura atrasada, empurrão): reencaixa
+                melhor = None
+                for j, q in enumerate(cam):
+                    md = abs(q[0] - xy[0]) + abs(q[1] - xy[1])
+                    if md <= 2 and (melhor is None or (md, -j) < melhor[0]):
+                        melhor = ((md, -j), j)
+                if melhor is None:
+                    return "FORA_DO_CAMINHO"
+                q = cam[melhor[1]]
+                dx, dy = q[0] - xy[0], q[1] - xy[1]
+                d = ((1 if dx > 0 else -1), 0) if abs(dx) >= abs(dy) else (0, (1 if dy > 0 else -1))
+                self._teclas(TECLAS_DIR[d])
+                self.mundo.aguardar_mudanca(p, 0.25)
+                continue
+            nxt = cam[i + 1]
+            d = (nxt[0] - xy[0], nxt[1] - xy[1])
+            self._teclas(TECLAS_DIR[d])                      # d é sempre cardinal: uma tecla só
+            if xy != ult_p:
+                ult_p, ult_t = xy, agora
+            elif agora - ult_t > 1.0:
+                return "TRAVADO"                              # não saiu do lugar há 1 s (monstro/obstáculo na frente)
+            self.mundo.aguardar_mudanca(p, 0.25)
+
+    def _executar_fuga(self, li):
+        cam, self.fuga_pedido = self.fuga_pedido, None
+        self.log(f"FUGA: {cam[0]} -> {cam[-1]} ({len(cam) - 1} passos, só em cruz). Shift+F para tudo.")
+        self._em_fuga = True
+        res = "OK"
+        try:
+            res = self._seguir_cardinal(cam)
+        finally:
+            self._em_fuga = False
+            self._teclas(set())
+            self.fuga_fim = True
+        self.log(f"FUGA: terminou ({res}) em {self.mundo.pos()}.")
+
+    def _aguardar_portao(self, destino, li=None, exige=False):
+        """Solta as teclas e espera o portão abrir. True = abriu; False = pediram para parar.
+        exige=True: chegou ANDANDO nesta parada, então o portão só abre depois de VER o bando (ou de esperar um tempo)."""
+        self.na_parada = True
+        if li is not None and self.on_parada:
+            self.on_parada(exige)
+        try:
+            return self._aguardar_portao_loop(destino, li)
+        finally:
+            self.na_parada = False
+            if li is not None and self.on_saida:
+                self.on_saida()
+
+    def _aguardar_portao_loop(self, destino, li):
         t0 = self.rel.agora()
         ult_log, ult_alerta, motivo_ant = t0, t0, None
         while not self.parar.is_set():
+            if self.fuga_pedido is not None and li is not None:
+                self._executar_fuga(li)
+                continue
             self._teclas(set())
             ok, motivo = self.portao(self.rel.agora())
             agora = self.rel.agora()
@@ -657,7 +752,7 @@ class Player:
                     self.log(f"Interrompido: {res}")
                     return res
                 self.log(f"lure {li + 1} concluído em {self.rel.agora() - t0:.1f} s")
-                self.parada(li)
+                self.parada(li, self.rel.agora() - t0)
                 li = (li + 1) % len(self.rota)
                 if li == 0:
                     self.stats["voltas"] += 1

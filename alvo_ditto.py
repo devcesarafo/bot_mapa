@@ -28,6 +28,9 @@ JITTER_P = 0.4                      # fração dos lures em que o tile gravado d
 JITTER_TILES = 1                    # variação máxima (tiles) em x e y
 DITTO_FIM_RAIO = 2                  # se o tile gravado não for livre, procura um livre até esse raio
 DITTO_FIM_MIN_TR = 3                # nunca mais perto que isso do personagem (cheb)
+BOX_OBSTRUIDOS = 8                  # Ditto 'boxeado' = pelo menos tantos dos 8 tiles em volta obstruídos (monstro, obstáculo do mapa ou personagem)
+CRUZ_MIN_TR = 3                     # o passo em cruz nunca leva o Ditto a menos que isso do personagem (cheb)
+CRUZ = (("norte", 0, -1), ("leste", 1, 0), ("sul", 0, 1), ("oeste", -1, 0))
 
 
 class AlvoDitto:
@@ -173,6 +176,59 @@ class AlvoDitto:
 
     def cobertura(self, M, T):
         return sum(1 for m in M if self.na_area(m, T))
+
+    # ---- PASSO EM CRUZ (1 tile): só quando o Ditto está boxeado e há monstro fora da área
+    def obstruidos(self, pos, M, D):
+        """Quantos dos 8 tiles em volta do Ditto estão obstruídos: monstro, obstáculo/parede do mapa ou o personagem."""
+        ocup = set(M)
+        ocup.add((pos[0], pos[1]))
+        return sum(1 for dx, dy in self.ANEL if (D[0] + dx, D[1] + dy) in ocup or not self.livre(D[0] + dx, D[1] + dy))
+
+    def passo_cruz(self, pos, mon_off, d_off, n_total):
+        """Anda o Ditto 1 TILE (norte/leste/sul/oeste a partir do centro dele). Só se estiver boxeado (>= BOX_OBSTRUIDOS de 8 em volta
+        obstruídos) e houver monstro fora da área. O tile de destino precisa ser andável no mapa (monstro nele pode: o Ditto o empurra).
+        Escolhe o sentido que mantém/aumenta a cobertura, libera mais dos 3 tiles de trás (o antigo e os 2 laterais) e fica mais perto
+        dos que estão fora. -> (tx, ty relativos ao personagem, info) ou (None, None, motivo)."""
+        M, D = self.tiles(pos, mon_off, d_off)
+        if D is None or len(M) < 2:
+            return None, None, "Ditto não localizado"
+        obs = self.obstruidos(pos, M, D)
+        if obs < BOX_OBSTRUIDOS:
+            return None, None, f"Ditto não está boxeado ({obs}/8 obstruídos)"
+        fora = [m for m in M if not self.na_area(m, D)]
+        if not fora:
+            return None, None, "todos os localizados já estão na área"
+        cov0 = self.cobertura(M, D)
+        d_tr0 = max(abs(D[0] - pos[0]), abs(D[1] - pos[1]))
+        dist_fora0 = sum(max(abs(m[0] - D[0]), abs(m[1] - D[1])) for m in fora) / len(fora)
+        melhor = None
+        for nome, dx, dy in CRUZ:
+            N = (D[0] + dx, D[1] + dy)
+            if not self.livre(N[0], N[1]) or N == (pos[0], pos[1]):
+                continue                                     # parede/obstáculo/personagem: não anda para lá
+            tx, ty = N[0] - pos[0], N[1] - pos[1]
+            if abs(tx) > JANELA_X or abs(ty) > JANELA_Y:
+                continue
+            if max(abs(tx), abs(ty)) < min(d_tr0, CRUZ_MIN_TR):
+                continue                                     # não chega perto do personagem
+            cov1 = self.cobertura(M, N)
+            if cov1 < cov0:
+                continue                                     # não pode perder quem já está na área
+            px, py = abs(dy), abs(dx)                        # lateral do sentido
+            atras = [D, (D[0] + px, D[1] + py), (D[0] - px, D[1] - py)]
+            livres_atras = sum(1 for q in atras if self.livre(q[0], q[1]))
+            dist_fora = sum(max(abs(m[0] - N[0]), abs(m[1] - N[1])) for m in fora) / len(fora)
+            if dist_fora > dist_fora0 + 1e-9:
+                continue                                     # não se afasta de quem está fora da área
+            score = cov1 * 10 + livres_atras * 2 - dist_fora * 0.5
+            if melhor is None or score > melhor[0]:
+                melhor = (score, nome, N, tx, ty, cov1, livres_atras)
+        if melhor is None:
+            return None, None, "nenhum sentido em cruz é seguro (parede, perde cobertura, afasta do grupo ou chega perto do personagem)"
+        _, nome, N, tx, ty, cov1, la = melhor
+        nao_loc = max(0, n_total - len(M))
+        return tx, ty, (f"1 tile para {nome}: Ditto ({D[0]},{D[1]}) -> ({N[0]},{N[1]}), boxeado {obs}/8, cobertura {cov0} -> {cov1} de {len(M)} "
+                        f"localizados, {len(fora)} fora, {la}/3 tiles de trás livres" + (f"; {nao_loc} da lista não localizados" if nao_loc else ""))
 
     def mergulho(self, pos, mon_off, d_off, n_total):
         """SOLUÇÃO 1: o Ditto vai para DENTRO do grupo, no tile que deixa MAIS monstros na área do Whirlwind (idealmente todos), e o R

@@ -19,6 +19,7 @@ ABRE_S = 0.5             # condições verdadeiras por pelo menos isso
 LEITURAS_SEGUIDAS = 2
 VALIDADE_S = 0.8         # leitura mais velha que isso = portão fechado
 ALERTA_S = 30.0
+BANDO_ESPERA_S = 15.0    # chegou andando na parada e NÃO viu monstro nenhum: espera o bando (pode estar atrás) até isso
 
 
 class Portao:
@@ -30,12 +31,24 @@ class Portao:
         self.motivo = "sem leitura ainda"
         self.seguidas = 0
         self.desde = None
+        self.parada_ativa, self.chegada, self.visto, self.exige, self._avisou = False, 0.0, False, False, False
+
+    # -- chamado pelo Player ao chegar numa parada / ao sair dela (relógio do bot)
+    def nova_parada(self, agora, exige):
+        with self.lock:
+            self.parada_ativa, self.chegada, self.visto, self.exige, self._avisou = True, agora, False, bool(exige), False
+
+    def fim_parada(self):
+        with self.lock:
+            self.parada_ativa = False
 
     # -- chamado pelo laço de combate a cada quadro (agora = relógio do bot)
     def atualizar(self, agora, r, leitura_ok):
         motivo = self._avaliar(r, leitura_ok)
         with self.lock:
             self.t_leitura = agora
+            if self.parada_ativa and r is not None and (r.get("n_monstros") or 0) > 0:
+                self.visto = True                       # o bando apareceu NESTA parada
             if motivo is None:
                 self.seguidas += 1
                 if self.desde is None:
@@ -68,4 +81,11 @@ class Portao:
         with self.lock:
             if agora - self.t_leitura > VALIDADE_S:
                 return False, "sem leitura fresca (bot não está alimentando o portão)"
+            if self.ok and self.parada_ativa and self.exige and not self.visto:
+                # chegou ANDANDO e nenhum monstro apareceu: lista vazia não prova que o bando morreu (pode estar atrás, fora da tela)
+                if agora - self.chegada < BANDO_ESPERA_S:
+                    return False, f"aguardando o bando chegar (nenhum monstro visto nesta parada; {agora - self.chegada:.0f}/{BANDO_ESPERA_S:.0f} s)"
+                if not self._avisou:
+                    self._avisou = True
+                    self.log(f"[AVISO] {BANDO_ESPERA_S:.0f} s na parada e nenhum monstro apareceu: o lure veio vazio? Sigo para o próximo.")
             return self.ok, self.motivo
